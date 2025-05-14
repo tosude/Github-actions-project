@@ -1,0 +1,498 @@
+name: Create Feature Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: "Target GitHub Repository"
+        required: true
+        type: string
+      feature_env_name:
+        description: "Feature Environment Name"
+        required: true
+        type: string
+      base_branch:
+        description: "Base GitHub Branch"
+        required: true
+        type: string
+        default: "main"
+      dev_db_name:
+        description: "Development Database Name to clone from"
+        required: true
+        type: string
+      secret_name:
+        description: "secret Name to clone from to create secret for feature env"
+        required: true
+        type: string
+      resource_group:
+        description: "Azure Resource Group"
+        required: true
+        type: string
+      organization:
+        description: "Terraform/github Organization"
+        required: true
+        type: string
+        default: "MetLifeLegalPlans"
+
+jobs:
+  create-environment:
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKSPACE: "feature-${{ github.event.inputs.feature_env_name }}"
+      FEATURE_ENV: "${{ github.event.inputs.feature_env_name }}"
+      my-resource-group:  "${{ github.event.inputs.resource_group }}"
+
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.inputs.base_branch }}
+
+      # ===== AWS Authentication =====
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_DEV }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_DEV }}
+          aws-region: us-east-1
+
+      # ===== Azure Authentication =====
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ===== Create Azure Database =====
+      - name: Create Azure Flexible Server from Snapshot
+        id: create-db
+        run: |
+          # Get the most recent dev DB snapshot
+          DEV_DB_NAME="${{ github.event.inputs.dev_db_name }}"
+          RESOURCE_GROUP="${{ github.event.inputs.resource_group }}"
+
+          echo "Creating feature database 'feature-${FEATURE_ENV}' from ${DEV_DB_NAME}"
+
+          # Create the new database from source server
+          DB_RESPONSE=$(az postgres flexible-server restore \
+            --resource-group ${RESOURCE_GROUP} \
+            --name "feature-${FEATURE_ENV}" \
+            --source-server ${DEV_DB_NAME})
+            # --restore-point-in-time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            #--output json
+
+          # Extract the FQDN for the database
+          DB_FQDN=$(echo $DB_RESPONSE | jq -r '.fullyQualifiedDomainName')
+          echo "db_fqdn=${DB_FQDN}" >> $GITHUB_OUTPUT
+
+          echo "Azure DB created with FQDN: ${DB_FQDN}"
+
+
+      # ===== DB Secret Management =====
+      - name: Retrieve and Create DB Secrets
+        run: |
+          # Get the dev DB secret name from input parameters (this is the secret we want to clone)
+          DEV_SECRET_NAME="${{ github.event.inputs.secret_name }}"
+
+           # Retrieve dev DB credentials from the source secret
+           echo "Retrieving dev DB credentials from AWS Secrets Manager: ${DEV_SECRET_NAME}"
+           DEV_SECRET_VALUE=$(aws secretsmanager get-secret-value \
+              --secret-id "${DEV_SECRET_NAME}" \
+              --query 'SecretString' \
+              --output text)
+
+          # Create new secret for feature environment with updated host value
+          FEATURE_SECRET_VALUE=$(echo ${DEV_SECRET_VALUE} | jq --arg host "${{ steps.create-db.outputs.db_fqdn }}" '.host = $host')
+
+          # Feature environment secret name
+          FEATURE_SECRET_NAME="feature-${FEATURE_ENV}-db-secret"
+
+          # Check if the feature secret already exists
+          echo "Checking if secret ${FEATURE_SECRET_NAME} already exists..."
+          SECRET_CHECK=$(aws secretsmanager describe-secret --secret-id "${FEATURE_SECRET_NAME}" 2>/dev/null || echo "NotFound")
+
+          if [[ $SECRET_CHECK == *"NotFound"* ]]; then
+            # Create new secret if it doesn't exist
+            echo "Creating new secret: ${FEATURE_SECRET_NAME}"
+            aws secretsmanager create-secret \
+               --name "${FEATURE_SECRET_NAME}" \
+               --secret-string "${FEATURE_SECRET_VALUE}" \
+               --region us-east-1
+          else
+            # Update existing secret
+            echo "Secret ${FEATURE_SECRET_NAME} already exists, updating it..."
+            aws secretsmanager update-secret \
+              --secret-id "${FEATURE_SECRET_NAME}" \
+              --secret-string "${FEATURE_SECRET_VALUE}" \
+              --region us-east-1
+          fi
+
+          echo "✅ Database credentials stored in AWS Secrets Manager: ${FEATURE_SECRET_NAME}"
+
+      # ===== GitHub Branch Creation =====
+      - name: Create a New GitHub Branch
+        run: |
+          echo "Creating branch in target repository: ${{ github.event.inputs.target_repository }}"
+          git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.event.inputs.organization }}/${{ github.event.inputs.target_repository }}.git target-repo
+          cd target-repo
+
+          # Setup git config
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          # Fetch the base branch and create a new feature branch
+          git fetch origin ${{ github.event.inputs.base_branch }}
+          git checkout -b "feature/${FEATURE_ENV}" "origin/${{ github.event.inputs.base_branch }}"
+
+
+          # Create or update environment config file
+          cat > terraform/feature-env.tfvars <<EOF
+          environment_name = "${FEATURE_ENV}"
+          db_secret_name = "feature-${FEATURE_ENV}-db-secret"
+          azure_db_name = "feature-${FEATURE_ENV}"
+          azure_resource_group = "my-resource-group"
+          aws_region = "us-east-1"
+          parameter_group_name = "parameter_group_name"
+          EOF
+
+          git add .
+          git commit -m "Configure for feature environment ${FEATURE_ENV}"
+          git push --set-upstream origin "feature/${FEATURE_ENV}"
+
+      # ===== Terraform Setup =====
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      # ===== Create Terraform Workspace =====
+      - name: Create Terraform Workspace
+        id: create-workspace
+        run: |
+          # Create a JSON file with the payload
+          cat > workspace.json << EOF
+          {
+            "data": {
+            "type": "workspaces",
+            "attributes": {
+              "name": "feature-${FEATURE_ENV}",
+              "terraform-version": "1.5.0",
+              "working-directory": "/terraform",
+              "vcs-repo": {
+                      "identifier":  "MetLifeLegalPlans/${{ github.event.inputs.target_repository }}",
+                      "branch": "feature/${FEATURE_ENV}",
+                      "oauth-token-id": "${{ secrets.TF_VCS_OAUTH_TOKEN_ID }}"
+              }
+            }
+           }
+          }
+          EOF
+
+
+          # Check if workspace already exists
+          WORKSPACE_CHECK=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/MetLifeLegalPlans/workspaces/feature-${FEATURE_ENV}")
+
+          if [[ $WORKSPACE_CHECK == *"errors"* ]]; then
+            echo "Creating new Terraform workspace: feature-${FEATURE_ENV}"
+            WORKSPACE_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              --data @workspace.json  \
+              https://app.terraform.io/api/v2/organizations/MetLifeLegalPlans/workspaces)
+
+            echo "Extracting workspace ID"
+            WORKSPACE_ID=$(echo $WORKSPACE_RESPONSE | jq -r '.data.id')
+            echo "workspace_id=${WORKSPACE_ID}" >> $GITHUB_OUTPUT
+          else
+            echo "Workspace already exists"
+            WORKSPACE_ID=$(echo $WORKSPACE_CHECK | jq -r '.data.id')
+            echo "workspace_id=${WORKSPACE_ID}" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Full workspace creation response:"
+          echo $WORKSPACE_RESPONSE | jq '.'
+
+          if [ "$WORKSPACE_ID" == "null" ]; then
+          echo "Workspace creation failed. Cannot continue."
+          exit 1
+          fi
+
+      #  Attach Variable Set to Workspace
+      - name: Attach Existing Variable Set to Terraform Workspace
+        run: |
+            WORKSPACE_ID="${{ steps.create-workspace.outputs.workspace_id }}"
+
+            # Get the ID of the existing variable set
+            VARIABLE_SET_NAME="AWS MLP DEV"
+
+            echo "Retrieving variable set ID for: ${VARIABLE_SET_NAME}"
+            VARIABLE_SET_RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2/organizations/${{ github.event.inputs.organization }}/varsets")
+
+            # Extract the ID of the variable set with the specified name
+            VARIABLE_SET_ID=$(echo $VARIABLE_SET_RESPONSE | jq -r '.data[] | select(.attributes.name == "'"${VARIABLE_SET_NAME}"'") | .id')
+
+            if [ -z "$VARIABLE_SET_ID" ] || [ "$VARIABLE_SET_ID" == "null" ]; then
+              echo "Error: Could not find variable set with name: ${VARIABLE_SET_NAME}"
+              exit 1
+            fi
+
+            echo "Found variable set ID: ${VARIABLE_SET_ID}"
+
+            # Attach the variable set to the workspace
+            echo "Attaching variable set to workspace"
+            ATTACH_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              --data '{
+                "data": [
+                  {
+                    "type": "workspaces",
+                    "id": "'"${WORKSPACE_ID}"'"
+                  }
+                 ]
+               }' \
+               "https://app.terraform.io/api/v2/varsets/${VARIABLE_SET_ID}/relationships/workspaces")
+
+            # Check if attachment was successful
+            if [[ $ATTACH_RESPONSE == *"errors"* ]]; then
+              echo "Error attaching variable set to workspace:"
+              echo $ATTACH_RESPONSE | jq '.'
+              exit 1
+            else
+              echo "✅ Successfully attached variable set to workspace"
+            fi
+
+
+      # ===== Add Terraform Variables =====
+      - name: Add Variables to Terraform Workspace
+        run: |
+          WORKSPACE_ID="${{ steps.create-workspace.outputs.workspace_id }}"
+
+          FEATURE_SECRET_NAME="feature-${FEATURE_ENV}-db-secret"
+          DB_SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "${FEATURE_SECRET_NAME}" --query "ARN" --output text)
+
+          echo "Using DB Secret ARN: ${DB_SECRET_ARN}"
+
+
+          # Define variables in an associative array
+          declare -A terraform_vars
+          terraform_vars["parameter_group_name"]="default.redis7"
+          terraform_vars["max_capacity"]="5"
+          terraform_vars["min_capacity"]="1"
+          terraform_vars["project"]="attorneys-feat"
+          terraform_vars["portunus_client_secrets_value"]=""
+          terraform_vars["environment"]="feature"
+
+
+          # Add any additional variables here
+
+          # Loop through the variables and create each one
+          for key in "${!terraform_vars[@]}"; do
+            value="${terraform_vars[$key]}"
+            echo "Creating variable: $key = $value"
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              --data '{
+                "data": {
+                  "type": "vars",
+                  "attributes": {
+                    "key":  "'"$key"'",
+                    "value": "'"$value"'",
+                    "description": "configuration for feature environment",
+                    "category": "terraform"
+                  },
+                  "relationships": {
+                    "workspace": {
+                      "data": {
+                        "id": "'"${WORKSPACE_ID}"'",
+                        "type": "workspaces"
+                      }
+                     }
+                  }
+                }
+              }' \
+              https://app.terraform.io/api/v2/vars
+          done
+          echo "All variables created successfully"
+
+
+          #Create JSON payload file directly
+          cat > backend_env.json << EOF
+          {
+            "data": {
+              "type": "vars",
+              "attributes": {
+                "key": "backend_environment",
+                "value": "[{name=\"DATABASE_SECRET\",value=\"${DB_SECRET_ARN}\"},{name=\"DJANGO_ALLOWED_HOST\",value=\"*\"},{name=\"DJANGO_EMAIL_HOST_PASSWORD\",value=\"arn:aws:secretsmanager:us-east-1:211125714968:secret:members/django-email-host-password-LUJQuf\"},{name=\"DJANGO_EMAIL_HOST_USER\",value=\"AKIA35JRGWJJXN6L2GNG\"},{name=\"DJANGO_ENVIRONMENT\",value=\"dev\"},{name=\"DJANGO_FRONTEND_SENTRY_DSN\",value=\"https://0bc62feef0934c23aaab00dd94bca852@o39628.ingest.sentry.io/6486951\"},{name=\"DJANGO_PRODUCTION\",value=\"False\"},{name=\"DJANGO_SENTRY_DSN\",value=\"https://deda245bb00c476098ac407a343ef6ef@o39628.ingest.sentry.io/5815943\"},{name=\"DJANGO_SHARED_DOMAIN\",value=\"feature-${FEATURE_ENV}.attorneys.legalplans.technology\"},{name=\"PORTUNUS_CLIENT_ID\",value=\"JEe5PTaempB9AEiBJKImQ3C9LHep0Dbl53ZBPyjo\"},{name=\"PORTUNUS_CLIENT_SECRET\",value=\"arn:aws:secretsmanager:us-east-1:211125714968:secret:attorneys/dev/portunus-client-secret-jxONsc\"},{name=\"POSTGRES_PASSWORD\",value=\"arn:aws:secretsmanager:us-east-1:211125714968:secret:mlp-datateam/azure/prod/attorneys_readonly-Q59ChB\"},{name=\"REDSHIFT_PASSWORD\",value=\"arn:aws:secretsmanager:us-east-1:211125714968:secret:data-prod/redshift-prod/attorney_app_account-h8gc4D\"}]",
+                "description": "Backend environment configuration for feature environment",
+                "category": "terraform",
+                "hcl": true
+              },
+              "relationships": {
+                "workspace": {
+                  "data": {
+                    "id": "${WORKSPACE_ID}",
+                    "type": "workspaces"
+                  }
+                }
+              }
+            }
+          }
+          EOF
+
+          #Send the request
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            --data @backend_env.json \
+            https://app.terraform.io/api/v2/vars
+
+          echo "✅ Backend environment variable created"
+
+
+      # ===== Create and Upload Terraform Config =====
+      - name: Configure Terraform Workspace Run Settings
+        run: |
+          # Set the var file to use
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            --data '{
+              "data": {
+                "type": "workspaces",
+                "attributes": {
+                  "terraform-version": "1.5.0",
+                  "working-directory": "terraform/environments",
+                  "operations": true,
+                  "execution-mode": "remote",
+                  "vcs-repo": {
+                    "identifier": "'"${{ github.repository }}"'",
+                    "branch": "feature/'"${FEATURE_ENV}"'",
+                    "oauth-token-id": "'"${{ secrets.TF_VCS_OAUTH_TOKEN_ID }}"'"
+                  }
+                }
+              }
+            }' \
+            https://app.terraform.io/api/v2/workspaces/${{ steps.create-workspace.outputs.workspace_id }}
+
+      # ===== Start Terraform Run =====
+      - name: Trigger Terraform Plan
+        id: tf-plan
+        run: |
+          # Trigger a plan in the workspace with var file
+          PLAN_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+            -H "Content-Type: application/vnd.api+json" \
+            --data '{
+              "data": {
+                "attributes": {
+                  "message": "Triggered by GitHub Actions workflow",
+                  "plan-only": true,
+                  "is-destroy": false,
+                  "terraform-version": "1.5.0"
+                },
+                "type": "runs",
+                "relationships": {
+                  "workspace": {
+                    "data": {
+                      "type": "workspaces",
+                      "id": "'"${{ steps.create-workspace.outputs.workspace_id }}"'"
+                    }
+                  }
+                }
+              }
+            }' \
+            https://app.terraform.io/api/v2/runs)
+
+          # Extract run ID
+          RUN_ID=$(echo $PLAN_RESPONSE | jq -r '.data.id')
+          echo "terraform_run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+          echo "Terraform plan started with run ID: $RUN_ID"
+          echo "View the run at: https://app.terraform.io/app/MetLifeLegalPlans/workspaces/feature-${FEATURE_ENV}/runs/$RUN_ID"
+
+      # ===== Wait for Plan Completion =====
+      - name: Wait for Terraform Plan to Complete
+        run: |
+          RUN_ID="${{ steps.tf-plan.outputs.terraform_run_id }}"
+
+          echo "Waiting for Terraform plan to complete..."
+          while true; do
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.TF_API_TOKEN }}" \
+              -H "Content-Type: application/vnd.api+json" \
+              https://app.terraform.io/api/v2/runs/$RUN_ID)
+
+            STATUS=$(echo $RESPONSE | jq -r '.data.attributes.status')
+            echo "Current status: $STATUS"
+
+            if [ "$STATUS" == "planned" ] || [ "$STATUS" == "planned_and_finished" ]; then
+              echo "Plan completed successfully."
+              break
+            elif [ "$STATUS" == "errored" ] || [ "$STATUS" == "canceled" ] || [ "$STATUS" == "discarded" ]; then
+              echo "Terraform run failed with status: $STATUS"
+              exit 1
+            fi
+
+            echo "Still waiting for plan to complete..."
+            sleep 15
+          done
+
+      # ===== Output Terraform Plan URL =====
+      - name: Output Terraform Plan URL for Manual Approval
+        run: |
+          RUN_ID="${{ steps.tf-plan.outputs.terraform_run_id }}"
+          WORKSPACE_ID="${{ steps.create-workspace.outputs.workspace_id }}"
+
+          # Get the organization from inputs
+          ORG="${{ github.event.inputs.organization }}"
+
+          echo "::notice::Terraform plan completed successfully! Please review and approve the plan at:"
+          echo "::notice::https://app.terraform.io/app/${ORG}/workspaces/feature-${FEATURE_ENV}/runs/${RUN_ID}"
+
+          # Create a GitHub issue with the approval instructions
+          REPO_OWNER=$(echo "${{ github.repository }}" | cut -d "/" -f 1)
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d "/" -f 2)
+
+          ISSUE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/issues" \
+            -d '{
+              "title": "Terraform Plan details: feature-'"${FEATURE_ENV}"'",
+              "body": "## Terraform Plan details\n\nA new feature environment **feature-'"${FEATURE_ENV}"'** has been created and the Terraform plan is ready for review.\n\n### Review the plan at:\n[Terraform Cloud Console](https://app.terraform.io/app/'"${ORG}"'/workspaces/feature-'"${FEATURE_ENV}"'/runs/'"${RUN_ID}"')\n\n### once plan is validated you can proceed to apply from terraform UI\n\n**Run ID:** `'"${RUN_ID}"'`\n**Workspace ID:** `'"${WORKSPACE_ID}"'`"
+            }')
+
+          ISSUE_NUMBER=$(echo $ISSUE_RESPONSE | jq -r '.number')
+          echo "::notice::Created approval request issue #${ISSUE_NUMBER}"
+
+          echo "terraform_plan_url=https://app.terraform.io/app/${ORG}/workspaces/feature-${FEATURE_ENV}/runs/${RUN_ID}" >> $GITHUB_OUTPUT
+          echo "terraform_workspace_id=${WORKSPACE_ID}" >> $GITHUB_OUTPUT
+
+
+      # ===== Completion Summary =====
+      - name: Feature Environment Creation Summary
+        env:
+          FEATURE_ENV: ${{ github.event.inputs.feature_env_name }}
+          ORGANIZATION: ${{ github.event.inputs.organization }}
+        run: |
+          echo "Feature environment '${FEATURE_ENV}' setup complete:"
+          echo ""
+          echo "✅ Azure Flexible Server: feature-${FEATURE_ENV}"
+          echo "✅ AWS Secret: feature-${FEATURE_ENV}-db-secret"
+          echo "✅ GitHub Branch: feature/${FEATURE_ENV}"
+          echo "✅ Terraform Workspace: feature-${FEATURE_ENV}"
+          echo "✅ Infrastructure Deployment: Completed"
+          echo ""
+          echo "View Terraform workspace: https://app.terraform.io/app/${ORGANIZATION}/workspaces/feature-${FEATURE_ENV}"
+          echo ""
+          echo "To access your new environment you need to go to the terraforn workspace and run a new plan and apply as this workflow only runs a plan of the environment:"
+
+
