@@ -32,7 +32,7 @@ on:
         description: "Terraform/github Organization"
         required: true
         type: string
-        default: "MetLifeLegalPlans"
+        default: "client"
 
 jobs:
   create-environment:
